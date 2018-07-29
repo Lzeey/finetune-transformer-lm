@@ -42,8 +42,8 @@ lr_schedules = {
 }
 
 def _norm(x, g=None, b=None, e=1e-5, axis=[1]):
-    u = tf.reduce_mean(x, axis=axis, keep_dims=True)
-    s = tf.reduce_mean(tf.square(x-u), axis=axis, keep_dims=True)
+    u = tf.reduce_mean(x, axis=axis, keepdims=True)
+    s = tf.reduce_mean(tf.square(x-u), axis=axis, keepdims=True)
     x = (x - u) * tf.rsqrt(s + e)
     if g is not None and b is not None:
         x = x*g + b
@@ -148,6 +148,7 @@ def block(x, scope, train=False, scale=False):
         return h
 
 def embed(X, we):
+    """This performs the token embedding, as well as positional embedding (in dim 2) (with reduce_sum)"""
     we = convert_gradient_to_tensor(we)
     e = tf.gather(we, X)
     h = tf.reduce_sum(e, 2)
@@ -165,9 +166,9 @@ def model(X, M, Y, train=False, reuse=False):
         we = tf.get_variable("we", [n_vocab+n_special+n_ctx, n_embd], initializer=tf.random_normal_initializer(stddev=0.02))
         we = dropout(we, embd_pdrop, train)
 
-        X = tf.reshape(X, [-1, n_ctx, 2])
+        X = tf.reshape(X, [-1, n_ctx, 2]) #To fit into the transfomer decoder. Now to figure out what exactly dim 2 is for
         M = tf.reshape(M, [-1, n_ctx])
-
+        
         h = embed(X, we)
         for layer in range(n_layer):
             h = block(h, 'h%d'%layer, train=train, scale=True)
@@ -228,6 +229,19 @@ def mgpu_predict(*xs):
     return ops
 
 def transform_roc(X1, X2, X3):
+    """Reshapes input into ROC training format. 
+    Also inserts special delimiters for start, middle, and end.
+    Returns transformed inputs and associated mask.
+    Each example in batch:
+    [(start_delim) -> x1 (story) -> (delim) -> x2 (end1) -> (delim)]
+    [(start_delim) -> x1 (story) -> (delim) -> x3 (end2) -> (delim)]
+    Parameters:
+        X1, X2, X3: List of List of ints (embedded)
+            X1 contains the stories (encoded). X2, and X3 are two responses
+    Output:
+        xmb: int32 np.array of size (num_samples, 2 (num_response), n_ctx, 2 (token, and positional embedding))
+        mmb: float32 np.array of size (num_samples, 2)
+    """
     n_batch = len(X1)
     xmb = np.zeros((n_batch, 2, n_ctx, 2), dtype=np.int32)
     mmb = np.zeros((n_batch, 2, n_ctx), dtype=np.float32)
@@ -242,6 +256,7 @@ def transform_roc(X1, X2, X3):
         xmb[i, 1, :l13, 0] = x13
         mmb[i, 0, :l12] = 1
         mmb[i, 1, :l13] = 1
+    # This is the positional embedding. The lm transformer decoder uses a learned version.
     xmb[:, :, :, 1] = np.arange(n_vocab+n_special, n_vocab+n_special+n_ctx)
     return xmb, mmb
 
@@ -320,14 +335,14 @@ def predict():
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--desc', type=str)
-    parser.add_argument('--dataset', type=str)
+    parser.add_argument('--desc', type=str, default='rocstories')
+    parser.add_argument('--dataset', type=str, default='rocstories')
     parser.add_argument('--log_dir', type=str, default='log/')
     parser.add_argument('--save_dir', type=str, default='save/')
     parser.add_argument('--data_dir', type=str, default='data/')
     parser.add_argument('--submission_dir', type=str, default='submission/')
-    parser.add_argument('--submit', action='store_true')
-    parser.add_argument('--analysis', action='store_true')
+    parser.add_argument('--submit', action='store_true', default=True)
+    parser.add_argument('--analysis', action='store_true', default=True)
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--n_iter', type=int, default=3)
     parser.add_argument('--n_batch', type=int, default=8)
@@ -344,7 +359,7 @@ if __name__ == '__main__':
     parser.add_argument('--clf_pdrop', type=float, default=0.1)
     parser.add_argument('--l2', type=float, default=0.01)
     parser.add_argument('--vector_l2', action='store_true')
-    parser.add_argument('--n_gpu', type=int, default=4)
+    parser.add_argument('--n_gpu', type=int, default=1)
     parser.add_argument('--opt', type=str, default='adam')
     parser.add_argument('--afn', type=str, default='gelu')
     parser.add_argument('--lr_schedule', type=str, default='warmup_linear')
@@ -369,6 +384,7 @@ if __name__ == '__main__':
     n_vocab = len(text_encoder.encoder)
 
     (trX1, trX2, trX3, trY), (vaX1, vaX2, vaX3, vaY), (teX1, teX2, teX3) = encode_dataset(rocstories(data_dir), encoder=text_encoder)
+    
     n_y = 2
     encoder['_start_'] = len(encoder)
     encoder['_delimiter_'] = len(encoder)
@@ -376,12 +392,14 @@ if __name__ == '__main__':
     clf_token = encoder['_classify_']
     n_special = 3
     max_len = n_ctx//2-2
-    n_ctx = min(max([len(x1[:max_len])+max(len(x2[:max_len]), len(x3[:max_len])) for x1, x2, x3 in zip(trX1, trX2, trX3)]+[len(x1[:max_len])+max(len(x2[:max_len]), len(x3[:max_len])) for x1, x2, x3 in zip(vaX1, vaX2, vaX3)]+[len(x1[:max_len])+max(len(x2[:max_len]), len(x3[:max_len])) for x1, x2, x3 in zip(teX1, teX2, teX3)])+3, n_ctx)
+    n_ctx = min(max([len(x1[:max_len])+max(len(x2[:max_len]), len(x3[:max_len])) for x1, x2, x3 in zip(trX1, trX2, trX3)]+[len(x1[:max_len])+max(len(x2[:max_len]), len(x3[:max_len])) for x1, x2, x3 in zip(vaX1, vaX2, vaX3)]+[len(x1[:max_len])+max(len(x2[:max_len]), len(x3[:max_len])) for x1, x2, x3 in zip(teX1, teX2, teX3)])+3, 
+                n_ctx)
+    # X and Mask
     trX, trM = transform_roc(trX1, trX2, trX3)
     vaX, vaM = transform_roc(vaX1, vaX2, vaX3)
     if submit:
         teX, teM = transform_roc(teX1, teX2, teX3)
-
+    
     n_train = len(trY)
     n_valid = len(vaY)
     n_batch_train = n_batch*n_gpu
@@ -401,7 +419,7 @@ if __name__ == '__main__':
     params = find_trainable_variables('model')
     sess = tf.Session(config=tf.ConfigProto(allow_soft_placement=True))
     sess.run(tf.global_variables_initializer())
-
+    raise()
     shapes = json.load(open('model/params_shapes.json'))
     offsets = np.cumsum([np.prod(shape) for shape in shapes])
     init_params = [np.load('model/params_{}.npy'.format(n)) for n in range(10)]
